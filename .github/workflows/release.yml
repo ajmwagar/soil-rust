@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: x86_64-unknown-linux-gnu
+          - os: macos-14
+            asset: aarch64-apple-darwin
+          - os: macos-13
+            asset: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --bin soil-c --bin soil-run
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/soil-rust-${{ matrix.asset }}.tar.gz" \
+            -C target/release soil-c soil-run
+          shasum -a 256 "dist/soil-rust-${{ matrix.asset }}.tar.gz" \
+            > "dist/soil-rust-${{ matrix.asset }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soil-rust-${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

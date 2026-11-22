@@ -25,12 +25,24 @@ cargo build -p soil-lang --bin soil-c --bin soil-run
 
 ```sh
 # from a checkout that has ajmwagar/soil next to ajmwagar/soil-rust
+SOURCE="$(cat ../soil/tests/runtime-smoke.soil)"
+
 cargo run -q -p soil-lang --bin soil-run -- \
   --prelude crates/soil-lang/stdlib/prelude.soil \
-  --call main ../soil/compiler/core.soil /tmp/compile-runtime.soil
+  --call main \
+  ../soil/compiler/core.soil ../soil/compiler/main.soil \
+  --arg "$SOURCE" > /tmp/runtime-bytes.txt
+
+python3 ../soil/scripts/bytes-to-wasm.py /tmp/runtime-bytes.txt /tmp/runtime.wasm
+wasmtime run --invoke rt/test-cons /tmp/runtime.wasm
+# 1
 ```
 
-The saved bootstrap seed from the monorepo transition:
+## Releases
+
+Tagged builds (`v*`) produce `soil-c` and `soil-run` archives for Linux x86-64,
+macOS arm64, and macOS x86-64. The saved bootstrap seed from the monorepo
+transition:
 
 ```text
 sha256 3f58bee9e33aecf79991a2e2bdfa1f81926d625aec9825d56427dacb857f53b5
