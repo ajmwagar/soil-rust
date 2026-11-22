@@ -11,12 +11,14 @@ use anyhow::{Result, bail};
 use soil_lang::sexp::Value;
 use soil_lang::{Host, Runtime};
 
+use wasip2::io::poll::Pollable;
 use wasip2::io::streams::{InputStream, OutputStream, StreamError};
 
 struct WasmHost {
     stdin: Option<InputStream>,
     stdout: Option<OutputStream>,
     stderr: Option<OutputStream>,
+    pollables: Vec<Pollable>,
 }
 
 impl WasmHost {
@@ -25,6 +27,7 @@ impl WasmHost {
             stdin: None,
             stdout: None,
             stderr: None,
+            pollables: Vec::new(),
         }
     }
 
@@ -91,6 +94,8 @@ impl Host for WasmHost {
                 | ("wasi:clocks/monotonic-clock", "resolution")
                 | ("wasi:clocks/wall-clock", "now")
                 | ("wasi:clocks/wall-clock", "resolution")
+                | ("wasi:clocks/monotonic-clock", "subscribe-duration")
+                | ("wasi:io/poll", "poll")
         )
     }
 
@@ -171,6 +176,33 @@ impl Host for WasmHost {
                         Value::Int(i64::from(clock.nanoseconds)),
                     ]),
                 ]))
+            }
+            ("wasi:clocks/monotonic-clock", "subscribe-duration") => {
+                let duration = args.first().and_then(Value::as_f64).unwrap_or(0.0) as u64;
+                let pollable = wasip2::clocks::monotonic_clock::subscribe_duration(duration);
+                self.pollables.push(pollable);
+                Ok(Value::Int(self.pollables.len() as i64))
+            }
+            ("wasi:io/poll", "poll") => {
+                let Some(handles) = args.first().and_then(Value::as_list) else {
+                    return Ok(err("poll needs a list of pollables"));
+                };
+                let mut refs = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    let Some(handle) = handle.as_f64() else {
+                        return Ok(err("poll handles must be integers"));
+                    };
+                    let Some(pollable) = self.pollables.get(handle as usize - 1) else {
+                        return Ok(err("unknown pollable handle"));
+                    };
+                    refs.push(pollable);
+                }
+                Ok(Value::List(
+                    wasip2::io::poll::poll(&refs)
+                        .into_iter()
+                        .map(|index| Value::Int(i64::from(index)))
+                        .collect(),
+                ))
             }
             ("wasi:filesystem", "read") => {
                 let path = args.first().and_then(Value::as_str).unwrap_or_default();
