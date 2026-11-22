@@ -90,6 +90,7 @@ impl Host for WasmHost {
                 | ("wasi:io/streams", "output-stream.blocking-flush")
                 | ("wasi:filesystem", "read")
                 | ("wasi:filesystem", "write")
+                | ("wasi:filesystem", "list")
                 | ("wasi:clocks/monotonic-clock", "now")
                 | ("wasi:clocks/monotonic-clock", "resolution")
                 | ("wasi:clocks/wall-clock", "now")
@@ -203,6 +204,32 @@ impl Host for WasmHost {
                         .map(|index| Value::Int(i64::from(index)))
                         .collect(),
                 ))
+            }
+            ("wasi:filesystem", "list") => {
+                let path = args.first().and_then(Value::as_str).unwrap_or_default();
+                let dir = std::path::Path::new(path);
+                let entries = match std::fs::read_dir(dir) {
+                    Ok(entries) => entries,
+                    Err(error) => return Ok(err(format!("list {path}: {error}"))),
+                };
+                let mut values = Vec::new();
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                    values.push(Value::List(vec![
+                        Value::List(vec![Value::Keyword("name".into()), Value::String(name)]),
+                        Value::List(vec![
+                            Value::Keyword("path".into()),
+                            Value::String(path.to_string_lossy().into_owned()),
+                        ]),
+                        Value::List(vec![
+                            Value::Keyword("dir".into()),
+                            Value::Bool(is_dir),
+                        ]),
+                    ]));
+                }
+                Ok(ok(Value::List(values)))
             }
             ("wasi:filesystem", "read") => {
                 let path = args.first().and_then(Value::as_str).unwrap_or_default();
