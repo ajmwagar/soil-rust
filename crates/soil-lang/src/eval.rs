@@ -12,18 +12,20 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::sexp::{Comment, Form, Token, Value, parse_all, parse_document, tokenize};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::sexp::{parse_all, parse_document, tokenize, Comment, Form, Token, Value};
+use anyhow::{anyhow, bail, Context, Result};
 
 #[derive(Clone)]
 struct Function {
     name: String,
+    package: String,
     params: Vec<String>,
     body: Vec<Value>,
 }
 
 #[derive(Clone)]
 struct Closure {
+    package: String,
     params: Vec<String>,
     body: Vec<Value>,
     env: HashMap<String, Value>,
@@ -31,6 +33,7 @@ struct Closure {
 
 struct CallFrame {
     name: String,
+    package: String,
     params: Vec<String>,
     body: Vec<Value>,
     env: HashMap<String, Value>,
@@ -177,10 +180,12 @@ impl Host for HostChain {
 
 impl Runtime {
     pub fn new(host: Box<dyn Host>) -> Self {
+        let mut packages = HashMap::new();
+        packages.insert("soil-user".to_string(), Package::default());
         Self {
             functions: HashMap::new(),
             macros: HashMap::new(),
-            packages: HashMap::new(),
+            packages,
             current_package: "soil-user".to_string(),
             constants: HashMap::new(),
             origins: HashMap::new(),
@@ -206,7 +211,10 @@ impl Runtime {
     }
 
     pub fn has_function(&self, name: &str) -> bool {
-        self.functions.contains_key(name)
+        self.resolve_function(name)
+            .ok()
+            .flatten()
+            .is_some_and(|name| self.functions.contains_key(&name))
     }
 
     fn snapshot(&self) -> RuntimeSnapshot {
@@ -235,6 +243,105 @@ impl Runtime {
         self.closures = snapshot.closures;
         self.next_closure = snapshot.next_closure;
         self.gensym = snapshot.gensym;
+    }
+
+    fn canonical_name(&self, package: &str, name: &str) -> String {
+        if package == "soil-user" {
+            name.to_string()
+        } else {
+            format!("{package}:{name}")
+        }
+    }
+
+    fn split_qualified(name: &str) -> Option<(&str, &str)> {
+        if name.starts_with(':') {
+            None
+        } else {
+            name.split_once(':')
+        }
+    }
+
+    fn definition_name(&self, name: &str) -> Result<String> {
+        if let Some((package, local)) = Self::split_qualified(name) {
+            if self.packages.contains_key(package) {
+                return Ok(format!("{package}:{local}"));
+            }
+            return Ok(name.to_string());
+        }
+        Ok(self.canonical_name(&self.current_package, name))
+    }
+
+    fn resolve_qualified<T>(
+        &self,
+        map: &HashMap<String, T>,
+        package: &str,
+        local: &str,
+        original: &str,
+    ) -> Result<Option<String>> {
+        if !self.packages.contains_key(package) {
+            return Ok(map.contains_key(original).then(|| original.to_string()));
+        }
+        let Some(declared) = self.packages.get(package) else {
+            return Ok(None);
+        };
+        if !declared.exports.iter().any(|export| export == local) {
+            bail!("symbol `{original}` is private to package `{package}`");
+        }
+        let name = format!("{package}:{local}");
+        Ok(map.contains_key(&name).then_some(name))
+    }
+
+    fn resolve_in_map<T>(&self, map: &HashMap<String, T>, name: &str) -> Result<Option<String>> {
+        let local = self.canonical_name(&self.current_package, name);
+        if map.contains_key(&local) {
+            return Ok(Some(local));
+        }
+
+        let mut found = None;
+        if let Some(package) = self.packages.get(&self.current_package) {
+            for used in &package.uses {
+                let Some(used_package) = self.packages.get(used) else {
+                    continue;
+                };
+                if !used_package.exports.iter().any(|export| export == name) {
+                    continue;
+                }
+                let candidate = self.canonical_name(used, name);
+                if !map.contains_key(&candidate) {
+                    continue;
+                }
+                if found.is_some() {
+                    bail!("ambiguous symbol `{name}` exported by multiple packages");
+                }
+                found = Some(candidate);
+            }
+        }
+        if found.is_some() {
+            return Ok(found);
+        }
+
+        Ok(map.contains_key(name).then(|| name.to_string()))
+    }
+
+    fn resolve_function(&self, name: &str) -> Result<Option<String>> {
+        if let Some((package, local)) = Self::split_qualified(name) {
+            return self.resolve_qualified(&self.functions, package, local, name);
+        }
+        self.resolve_in_map(&self.functions, name)
+    }
+
+    fn resolve_macro(&self, name: &str) -> Result<Option<String>> {
+        if let Some((package, local)) = Self::split_qualified(name) {
+            return self.resolve_qualified(&self.macros, package, local, name);
+        }
+        self.resolve_in_map(&self.macros, name)
+    }
+
+    fn resolve_constant(&self, name: &str) -> Result<Option<String>> {
+        if let Some((package, local)) = Self::split_qualified(name) {
+            return self.resolve_qualified(&self.constants, package, local, name);
+        }
+        self.resolve_in_map(&self.constants, name)
     }
 
     fn tick(&mut self) -> Result<()> {
@@ -287,12 +394,7 @@ impl Runtime {
         }
     }
 
-    fn try_load_with_limit(
-        &mut self,
-        source: &str,
-        origin: Option<&str>,
-        limit: u64,
-    ) -> Value {
+    fn try_load_with_limit(&mut self, source: &str, origin: Option<&str>, limit: u64) -> Value {
         let snapshot = self.snapshot();
         let previous_steps = self.steps;
         let previous_limit = self.step_limit;
@@ -360,7 +462,10 @@ impl Runtime {
             if let Some(list) = form.value.as_list() {
                 let head = list.first().and_then(Value::as_symbol);
                 if head == Some("defun") || head == Some("defmacro") {
-                    let (name, function) = parse_defun(list)?;
+                    let (name, mut function) = parse_defun(list)?;
+                    let name = self.definition_name(&name)?;
+                    function.name = name.clone();
+                    function.package = self.current_package.clone();
                     if head == Some("defun") {
                         self.functions.insert(name.clone(), function);
                     } else {
@@ -383,6 +488,7 @@ impl Runtime {
                 }
                 if head == Some("defconst") {
                     let (name, value) = parse_defconst(list)?;
+                    let name = self.definition_name(&name)?;
                     let mut env = HashMap::new();
                     let value = self.eval(&value, &mut env)?;
                     self.constants.insert(name.clone(), value);
@@ -547,9 +653,12 @@ impl Runtime {
     }
 
     pub fn call(&mut self, name: &str, args: &[Value]) -> Result<Value> {
+        let name = self
+            .resolve_function(name)?
+            .ok_or_else(|| anyhow!("unknown function `{name}`"))?;
         let function = self
             .functions
-            .get(name)
+            .get(&name)
             .cloned()
             .ok_or_else(|| anyhow!("unknown function `{name}`"))?;
         self.call_function(&function, args.to_vec())
@@ -558,6 +667,7 @@ impl Runtime {
     fn call_function(&mut self, function: &Function, args: Vec<Value>) -> Result<Value> {
         let frame = CallFrame {
             name: function.name.clone(),
+            package: function.package.clone(),
             params: function.params.clone(),
             body: function.body.clone(),
             env: HashMap::new(),
@@ -573,19 +683,33 @@ impl Runtime {
                 .ok_or_else(|| anyhow!("unknown function object {id}"))?;
             return Ok(CallFrame {
                 name: "lambda".to_string(),
+                package: closure.package.clone(),
                 params: closure.params.clone(),
                 body: closure.body.clone(),
                 env: closure.env.clone(),
             });
         }
         let name = value_text(function);
+        if let Some(function) = self.functions.get(&name).cloned() {
+            return Ok(CallFrame {
+                name: function.name,
+                package: function.package,
+                params: function.params,
+                body: function.body,
+                env: HashMap::new(),
+            });
+        }
+        let resolved = self
+            .resolve_function(&name)?
+            .ok_or_else(|| anyhow!("unknown function `{name}`"))?;
         let function = self
             .functions
-            .get(&name)
+            .get(&resolved)
             .cloned()
             .ok_or_else(|| anyhow!("unknown function `{name}`"))?;
         Ok(CallFrame {
             name: function.name,
+            package: function.package,
             params: function.params,
             body: function.body,
             env: HashMap::new(),
@@ -594,8 +718,16 @@ impl Runtime {
 
     /// Evaluate a call in a loop. A tail call returns a new frame and arguments
     /// instead of growing the Rust stack.
-    fn run_call(&mut self, mut frame: CallFrame, mut args: Vec<Value>) -> Result<Value> {
+    fn run_call(&mut self, frame: CallFrame, args: Vec<Value>) -> Result<Value> {
+        let previous = self.current_package.clone();
+        let result = self.run_call_inner(frame, args);
+        self.current_package = previous;
+        result
+    }
+
+    fn run_call_inner(&mut self, mut frame: CallFrame, mut args: Vec<Value>) -> Result<Value> {
         loop {
+            self.current_package = frame.package.clone();
             if args.len() != frame.params.len() {
                 bail!(
                     "{} expects {} arguments, got {}",
@@ -635,8 +767,8 @@ impl Runtime {
         let Some(head) = items.first().and_then(Value::as_symbol) else {
             return Ok(Tail::Value(self.eval(expression, env)?));
         };
-        if self.macros.contains_key(head) {
-            let expanded = self.expand_macro(head, &items[1..])?;
+        if let Some(name) = self.resolve_macro(head)? {
+            let expanded = self.expand_macro(&name, &items[1..])?;
             return self.eval_tail(&expanded, env);
         }
         match head {
@@ -690,11 +822,13 @@ impl Runtime {
                 };
                 Ok(Tail::Call(function, arguments))
             }
-            _ if self.functions.contains_key(head) => {
-                let arguments = self.eval_args(&items[1..], env)?;
-                Ok(Tail::Call(Value::Symbol(head.to_string()), arguments))
+            _ => {
+                if let Some(name) = self.resolve_function(head)? {
+                    let arguments = self.eval_args(&items[1..], env)?;
+                    return Ok(Tail::Call(Value::Symbol(name), arguments));
+                }
+                Ok(Tail::Value(self.eval(expression, env)?))
             }
-            _ => Ok(Tail::Value(self.eval(expression, env)?)),
         }
     }
 
@@ -764,12 +898,17 @@ impl Runtime {
                 args.len()
             );
         }
+        let previous = self.current_package.clone();
+        self.current_package = function.package.clone();
         let mut env = HashMap::new();
         for (name, value) in function.params.iter().zip(args) {
             env.insert(name.clone(), value);
         }
-        self.eval_body(&function.body, &mut env)
-            .with_context(|| format!("in macro `{}`", function.name))
+        let result = self
+            .eval_body(&function.body, &mut env)
+            .with_context(|| format!("in macro `{}`", function.name));
+        self.current_package = previous;
+        result
     }
 
     fn expand_macro(&mut self, name: &str, args: &[Value]) -> Result<Value> {
@@ -788,10 +927,10 @@ impl Runtime {
                     let Some(head) = items.first().and_then(Value::as_symbol) else {
                         return Ok(form);
                     };
-                    if !self.macros.contains_key(head) {
+                    let Some(name) = self.resolve_macro(head)? else {
                         return Ok(form);
-                    }
-                    self.expand_macro(head, &items[1..])?
+                    };
+                    self.expand_macro(&name, &items[1..])?
                 }
                 _ => return Ok(form),
             };
@@ -805,10 +944,10 @@ impl Runtime {
                 let Some(head) = items.first().and_then(Value::as_symbol) else {
                     return Ok(form);
                 };
-                if !self.macros.contains_key(head) {
+                let Some(name) = self.resolve_macro(head)? else {
                     return Ok(form);
-                }
-                self.expand_macro(head, &items[1..])
+                };
+                self.expand_macro(&name, &items[1..])
             }
             _ => Ok(form),
         }
@@ -897,19 +1036,24 @@ impl Runtime {
             | Value::Float(_)
             | Value::String(_)
             | Value::Keyword(_) => Ok(expression.clone()),
-            Value::Symbol(name) => env
-                .get(name)
-                .cloned()
-                .or_else(|| self.constants.get(name).cloned())
-                .ok_or_else(|| anyhow!("unbound symbol `{name}`")),
+            Value::Symbol(name) => {
+                if let Some(value) = env.get(name) {
+                    return Ok(value.clone());
+                }
+                let resolved = self.resolve_constant(name)?;
+                if let Some(value) = resolved.and_then(|name| self.constants.get(&name).cloned()) {
+                    return Ok(value);
+                }
+                bail!("unbound symbol `{name}`")
+            }
             Value::List(items) => {
                 let head = items
                     .first()
                     .and_then(Value::as_symbol)
                     .ok_or_else(|| anyhow!("empty or invalid call `{expression}`"))?;
 
-                if self.macros.contains_key(head) {
-                    let expanded = self.expand_macro(head, &items[1..])?;
+                if let Some(name) = self.resolve_macro(head)? {
+                    let expanded = self.expand_macro(&name, &items[1..])?;
                     return self.eval(&expanded, env);
                 }
 
@@ -941,6 +1085,9 @@ impl Runtime {
                             .and_then(Value::as_str)
                             .ok_or_else(|| anyhow!("in-package needs a name"))?
                             .to_string();
+                        if !self.packages.contains_key(&name) {
+                            bail!("unknown package `{name}`");
+                        }
                         self.current_package = name.clone();
                         Ok(Value::String(name))
                     }
@@ -966,6 +1113,7 @@ impl Runtime {
                         self.closures.insert(
                             id,
                             Closure {
+                                package: self.current_package.clone(),
                                 params,
                                 body,
                                 env: env.clone(),
@@ -1437,12 +1585,15 @@ impl Runtime {
                         Ok(Value::Float(value.floor()))
                     }
                     "=" | ">" | "<" | ">=" | "<=" => self.eval_comparison(head, &items[1..], env),
-                    name if self.functions.contains_key(name) => {
-                        let function = self.functions.get(name).cloned().unwrap();
-                        let args = self.eval_args(&items[1..], env)?;
-                        self.call_function(&function, args)
+                    name => {
+                        if let Some(resolved) = self.resolve_function(name)? {
+                            let function = self.functions.get(&resolved).cloned().unwrap();
+                            let args = self.eval_args(&items[1..], env)?;
+                            self.call_function(&function, args)
+                        } else {
+                            bail!("unknown form or function `{name}`")
+                        }
                     }
-                    name => bail!("unknown form or function `{name}`"),
                 }
             }
         }
@@ -1911,7 +2062,15 @@ fn parse_defun(list: &[Value]) -> Result<(String, Function)> {
     if body.is_empty() {
         bail!("defun needs a body");
     }
-    Ok((name.clone(), Function { name, params, body }))
+    Ok((
+        name.clone(),
+        Function {
+            name,
+            package: String::new(),
+            params,
+            body,
+        },
+    ))
 }
 
 fn truthy(value: &Value) -> bool {
@@ -2212,11 +2371,15 @@ mod safe_eval_tests {
     #[test]
     fn try_eval_returns_structured_errors_and_limits_steps() {
         let mut runtime = Runtime::new(Box::new(FakeHost::default()));
-        runtime.load("(defun spin (x) (spin x))").expect("load spin");
+        runtime
+            .load("(defun spin (x) (spin x))")
+            .expect("load spin");
         let value = runtime.load("(try-eval (spin 1) 1000)").expect("try-eval");
         assert!(is_tag(&value, "err"));
         assert!(format!("{value}").contains("step limit"));
-        let value = runtime.load("(try-eval (missing))").expect("try-eval missing");
+        let value = runtime
+            .load("(try-eval (missing))")
+            .expect("try-eval missing");
         assert!(is_tag(&value, "err"));
         assert!(format!("{value}").contains("eval"));
     }
@@ -2225,7 +2388,9 @@ mod safe_eval_tests {
     fn load_is_atomic_on_error() {
         let mut runtime = Runtime::new(Box::new(FakeHost::default()));
         assert!(runtime.load("(defun partial () 1) (missing)").is_err());
-        let value = runtime.load("(try-eval (partial))").expect("try-eval partial");
+        let value = runtime
+            .load("(try-eval (partial))")
+            .expect("try-eval partial");
         assert!(is_tag(&value, "err"));
     }
 
@@ -2236,7 +2401,9 @@ mod safe_eval_tests {
             .load("(try-load \"(defun partial-two () 2) (missing)\")")
             .expect("try-load");
         assert!(is_tag(&value, "err"));
-        let value = runtime.load("(try-eval (partial-two))").expect("try-eval partial-two");
+        let value = runtime
+            .load("(try-eval (partial-two))")
+            .expect("try-eval partial-two");
         assert!(is_tag(&value, "err"));
     }
 }
@@ -2244,6 +2411,42 @@ mod safe_eval_tests {
 #[cfg(test)]
 mod package_tests {
     use super::*;
+
+    #[test]
+    fn packages_resolve_and_enforce_exports() {
+        let mut runtime = Runtime::new(Box::new(FakeHost::default()));
+        runtime
+            .load(
+                "(defpackage \"acme/one\" (:export \"shared\"))
+                 (in-package \"acme/one\")
+                 (defun shared (x) (+ x 1))
+                 (defun private (x) (+ x 2))
+                 (in-package \"soil-user\")",
+            )
+            .expect("load package");
+        assert_eq!(
+            runtime
+                .call("acme/one:shared", &[Value::Int(1)])
+                .expect("qualified call"),
+            Value::Int(2)
+        );
+        assert!(runtime.call("acme/one:private", &[Value::Int(1)]).is_err());
+    }
+
+    #[test]
+    fn package_load_is_atomic() {
+        let mut runtime = Runtime::new(Box::new(FakeHost::default()));
+        assert!(runtime
+            .load(
+                "(defpackage \"acme/partial\" (:export \"foo\"))
+                     (in-package \"acme/partial\")
+                     (defun foo () 1)
+                     (missing)"
+            )
+            .is_err());
+        assert!(runtime.packages.get("acme/partial").is_none());
+        assert!(!runtime.functions.contains_key("acme/partial:foo"));
+    }
 
     #[test]
     fn defpackage_records_exports_and_in_package() {
