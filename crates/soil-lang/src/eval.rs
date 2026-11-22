@@ -1378,6 +1378,14 @@ impl Runtime {
                         self.eval(require(items, 1, "symbol?")?, env)?,
                         Value::Symbol(_)
                     ))),
+                    "keyword?" => Ok(Value::Bool(matches!(
+                        self.eval(require(items, 1, "keyword?")?, env)?,
+                        Value::Keyword(_)
+                    ))),
+                    "string?" => Ok(Value::Bool(matches!(
+                        self.eval(require(items, 1, "string?")?, env)?,
+                        Value::String(_)
+                    ))),
                     "atom" => {
                         let value = self.eval(require(items, 1, "atom")?, env)?;
                         Ok(if matches!(value, Value::List(_)) {
