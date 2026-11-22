@@ -60,9 +60,17 @@ enum Tail {
     Call(Value, Vec<Value>),
 }
 
+#[derive(Clone, Default)]
+struct Package {
+    uses: Vec<String>,
+    exports: Vec<String>,
+}
+
 pub struct Runtime {
     functions: HashMap<String, Function>,
     macros: HashMap<String, Function>,
+    packages: HashMap<String, Package>,
+    current_package: String,
     constants: HashMap<String, Value>,
     origins: HashMap<String, Origin>,
     forms: HashMap<String, Value>,
@@ -155,6 +163,8 @@ impl Runtime {
         Self {
             functions: HashMap::new(),
             macros: HashMap::new(),
+            packages: HashMap::new(),
+            current_package: "soil-user".to_string(),
             constants: HashMap::new(),
             origins: HashMap::new(),
             forms: HashMap::new(),
@@ -787,6 +797,20 @@ impl Runtime {
                         self.macros.insert(name, function);
                         Ok(Value::Nil)
                     }
+                    "defpackage" => {
+                        let (name, package) = parse_defpackage(items)?;
+                        self.packages.insert(name.clone(), package);
+                        Ok(Value::String(name))
+                    }
+                    "in-package" => {
+                        let name = items
+                            .get(1)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow!("in-package needs a name"))?
+                            .to_string();
+                        self.current_package = name.clone();
+                        Ok(Value::String(name))
+                    }
                     "lambda" => {
                         let params = items
                             .get(1)
@@ -1104,8 +1128,7 @@ impl Runtime {
                     }
                     "string-starts-with?" => {
                         let text = self.eval(require(items, 1, "string-starts-with?")?, env)?;
-                        let prefix =
-                            self.eval(require(items, 2, "string-starts-with?")?, env)?;
+                        let prefix = self.eval(require(items, 2, "string-starts-with?")?, env)?;
                         let Some(text) = text.as_str() else {
                             bail!("string-starts-with? expects a string");
                         };
@@ -1526,7 +1549,6 @@ fn is_json_object(items: &[Value]) -> bool {
     matches!(items, [Value::Symbol(name)] if name == JSON_OBJECT_MARKER)
 }
 
-
 /// Turn a parsed document into the record shape the linter and doc tools read.
 ///
 /// Forms retain their source byte span and leading comments. The raw comment
@@ -1541,7 +1563,13 @@ fn document_value(document: crate::sexp::Document, tokens: Vec<Token>) -> Result
         ),
         pair(
             "trailing-comments",
-            Value::List(document.trailing_comments.into_iter().map(comment_value).collect()),
+            Value::List(
+                document
+                    .trailing_comments
+                    .into_iter()
+                    .map(comment_value)
+                    .collect(),
+            ),
         ),
         pair(
             "tokens",
@@ -1650,6 +1678,53 @@ fn require<'a>(items: &'a [Value], index: usize, form: &str) -> Result<&'a Value
     items
         .get(index)
         .ok_or_else(|| anyhow!("{form} needs argument {index}"))
+}
+
+fn parse_defpackage(list: &[Value]) -> Result<(String, Package)> {
+    let name = list
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("defpackage needs a name"))?
+        .to_string();
+    let mut package = Package::default();
+    for clause in &list[2..] {
+        let Some(items) = clause.as_list() else {
+            bail!("defpackage clause is not a list");
+        };
+        let Some(key) = items.first().and_then(Value::as_keyword) else {
+            bail!("defpackage clause needs a keyword");
+        };
+        match key {
+            "use" => {
+                package.uses.extend(
+                    items[1..]
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| anyhow!("defpackage :use entry is not a symbol"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            "export" => {
+                package.exports.extend(
+                    items[1..]
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| anyhow!("defpackage :export entry is not a symbol"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok((name, package))
 }
 
 fn parse_defconst(list: &[Value]) -> Result<(String, Value)> {
@@ -1969,6 +2044,33 @@ fn err(code: &str) -> Value {
 }
 
 #[cfg(test)]
+mod package_tests {
+    use super::*;
+
+    #[test]
+    fn defpackage_records_exports_and_in_package() {
+        let mut runtime = Runtime::new(Box::new(FakeHost::default()));
+        runtime
+            .load(
+                "(defpackage \"acme/counter\" (:use \"soil\") (:export \"add\" \"greet\"))
+                 (in-package \"acme/counter\")
+                 (defun add (a b) (+ a b))",
+            )
+            .expect("load package");
+        assert_eq!(runtime.current_package, "acme/counter");
+        let package = runtime.packages.get("acme/counter").expect("package");
+        assert_eq!(package.uses, vec!["soil"]);
+        assert_eq!(package.exports, vec!["add", "greet"]);
+        assert_eq!(
+            runtime
+                .call("add", &[Value::Int(20), Value::Int(22)])
+                .unwrap(),
+            Value::Int(42)
+        );
+    }
+}
+
+#[cfg(test)]
 mod document_tests {
     use super::*;
 
@@ -1985,7 +2087,9 @@ mod document_tests {
         assert_eq!(forms.len(), 1);
         let form = &forms[0];
         assert_eq!(
-            field_value(form, &Value::Keyword("value".into())).as_list().unwrap()[1]
+            field_value(form, &Value::Keyword("value".into()))
+                .as_list()
+                .unwrap()[1]
                 .as_symbol(),
             Some("foo")
         );
