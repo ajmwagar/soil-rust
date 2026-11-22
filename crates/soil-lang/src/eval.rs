@@ -22,6 +22,7 @@ struct Function {
     body: Vec<Value>,
 }
 
+#[derive(Clone)]
 struct Closure {
     params: Vec<String>,
     body: Vec<Value>,
@@ -66,6 +67,20 @@ struct Package {
     exports: Vec<String>,
 }
 
+#[derive(Clone)]
+struct RuntimeSnapshot {
+    functions: HashMap<String, Function>,
+    macros: HashMap<String, Function>,
+    packages: HashMap<String, Package>,
+    current_package: String,
+    constants: HashMap<String, Value>,
+    origins: HashMap<String, Origin>,
+    forms: HashMap<String, Value>,
+    closures: HashMap<u64, Closure>,
+    next_closure: u64,
+    gensym: u64,
+}
+
 pub struct Runtime {
     functions: HashMap<String, Function>,
     macros: HashMap<String, Function>,
@@ -81,6 +96,8 @@ pub struct Runtime {
     args: Vec<String>,
     started: Instant,
     evals: u64,
+    steps: u64,
+    step_limit: Option<u64>,
     host_calls: u64,
     host_ms: u64,
 }
@@ -175,6 +192,8 @@ impl Runtime {
             args: Vec::new(),
             started: Instant::now(),
             evals: 0,
+            steps: 0,
+            step_limit: None,
             host_calls: 0,
             host_ms: 0,
         }
@@ -188,6 +207,107 @@ impl Runtime {
 
     pub fn has_function(&self, name: &str) -> bool {
         self.functions.contains_key(name)
+    }
+
+    fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            functions: self.functions.clone(),
+            macros: self.macros.clone(),
+            packages: self.packages.clone(),
+            current_package: self.current_package.clone(),
+            constants: self.constants.clone(),
+            origins: self.origins.clone(),
+            forms: self.forms.clone(),
+            closures: self.closures.clone(),
+            next_closure: self.next_closure,
+            gensym: self.gensym,
+        }
+    }
+
+    fn restore(&mut self, snapshot: RuntimeSnapshot) {
+        self.functions = snapshot.functions;
+        self.macros = snapshot.macros;
+        self.packages = snapshot.packages;
+        self.current_package = snapshot.current_package;
+        self.constants = snapshot.constants;
+        self.origins = snapshot.origins;
+        self.forms = snapshot.forms;
+        self.closures = snapshot.closures;
+        self.next_closure = snapshot.next_closure;
+        self.gensym = snapshot.gensym;
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        self.steps += 1;
+        if let Some(limit) = self.step_limit {
+            if self.steps > limit {
+                bail!("evaluation step limit exceeded ({limit})");
+            }
+        }
+        Ok(())
+    }
+
+    fn eval_limit(
+        &mut self,
+        expression: Option<&Value>,
+        env: &mut HashMap<String, Value>,
+    ) -> Result<u64> {
+        match expression {
+            None => Ok(1_000_000),
+            Some(expression) => {
+                let value = self.eval(expression, env)?;
+                match value.as_f64() {
+                    Some(value) if value > 0.0 => Ok(value as u64),
+                    _ => bail!("evaluation limit must be a positive integer"),
+                }
+            }
+        }
+    }
+
+    fn try_eval_with_limit(
+        &mut self,
+        expression: &Value,
+        env: &mut HashMap<String, Value>,
+        limit: u64,
+    ) -> Value {
+        let snapshot = self.snapshot();
+        let previous_steps = self.steps;
+        let previous_limit = self.step_limit;
+        self.steps = 0;
+        self.step_limit = Some(limit);
+        let result = self.eval(expression, env);
+        self.steps = previous_steps;
+        self.step_limit = previous_limit;
+        match result {
+            Ok(value) => ok(value),
+            Err(error) => {
+                self.restore(snapshot);
+                eval_error("eval", error)
+            }
+        }
+    }
+
+    fn try_load_with_limit(
+        &mut self,
+        source: &str,
+        origin: Option<&str>,
+        limit: u64,
+    ) -> Value {
+        let snapshot = self.snapshot();
+        let previous_steps = self.steps;
+        let previous_limit = self.step_limit;
+        self.steps = 0;
+        self.step_limit = Some(limit);
+        let result = self.load_source(source, origin);
+        self.steps = previous_steps;
+        self.step_limit = previous_limit;
+        match result {
+            Ok(value) => ok(value),
+            Err(error) => {
+                self.restore(snapshot);
+                eval_error("load", error)
+            }
+        }
     }
 
     pub fn load_file(&mut self, path: impl AsRef<Path>) -> Result<Value> {
@@ -221,6 +341,17 @@ impl Runtime {
     }
 
     pub fn load_source(&mut self, source: &str, origin: Option<&str>) -> Result<Value> {
+        let snapshot = self.snapshot();
+        match self.load_source_inner(source, origin) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.restore(snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    fn load_source_inner(&mut self, source: &str, origin: Option<&str>) -> Result<Value> {
         let document = parse_document(source)?;
         let source_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
         let mut last = Value::Nil;
@@ -497,6 +628,7 @@ impl Runtime {
 
     fn eval_tail(&mut self, expression: &Value, env: &mut HashMap<String, Value>) -> Result<Tail> {
         self.evals += 1;
+        self.tick()?;
         let Value::List(items) = expression else {
             return Ok(Tail::Value(self.eval(expression, env)?));
         };
@@ -757,6 +889,7 @@ impl Runtime {
 
     fn eval(&mut self, expression: &Value, env: &mut HashMap<String, Value>) -> Result<Value> {
         self.evals += 1;
+        self.tick()?;
         match expression {
             Value::Nil
             | Value::Bool(_)
@@ -926,6 +1059,19 @@ impl Runtime {
                     "eval" => {
                         let form = self.eval(require(items, 1, "eval")?, env)?;
                         self.eval(&form, env)
+                    }
+                    "try-eval" => {
+                        let form = require(items, 1, "try-eval")?;
+                        let limit = self.eval_limit(items.get(2), env)?;
+                        Ok(self.try_eval_with_limit(form, env, limit))
+                    }
+                    "try-load" => {
+                        let source = self.eval(require(items, 1, "try-load")?, env)?;
+                        let source = source
+                            .as_str()
+                            .ok_or_else(|| anyhow!("try-load expects a string"))?;
+                        let limit = self.eval_limit(items.get(2), env)?;
+                        Ok(self.try_load_with_limit(source, None, limit))
                     }
                     "load" => {
                         let source = self.eval(require(items, 1, "load")?, env)?;
@@ -1780,6 +1926,22 @@ fn is_tag(value: &Value, tag: &str) -> bool {
         == Some(tag)
 }
 
+fn eval_error(kind: &str, error: anyhow::Error) -> Value {
+    Value::List(vec![
+        Value::Symbol("err".to_string()),
+        Value::List(vec![
+            Value::List(vec![
+                Value::Keyword("kind".to_string()),
+                Value::String(kind.to_string()),
+            ]),
+            Value::List(vec![
+                Value::Keyword("message".to_string()),
+                Value::String(format!("{error:#}")),
+            ]),
+        ]),
+    ])
+}
+
 fn function_object(id: u64) -> Value {
     Value::List(vec![
         Value::Symbol("#<function>".to_string()),
@@ -2041,6 +2203,42 @@ fn err(code: &str) -> Value {
         Value::Symbol("err".to_string()),
         Value::Symbol(code.to_string()),
     ])
+}
+
+#[cfg(test)]
+mod safe_eval_tests {
+    use super::*;
+
+    #[test]
+    fn try_eval_returns_structured_errors_and_limits_steps() {
+        let mut runtime = Runtime::new(Box::new(FakeHost::default()));
+        runtime.load("(defun spin (x) (spin x))").expect("load spin");
+        let value = runtime.load("(try-eval (spin 1) 1000)").expect("try-eval");
+        assert!(is_tag(&value, "err"));
+        assert!(format!("{value}").contains("step limit"));
+        let value = runtime.load("(try-eval (missing))").expect("try-eval missing");
+        assert!(is_tag(&value, "err"));
+        assert!(format!("{value}").contains("eval"));
+    }
+
+    #[test]
+    fn load_is_atomic_on_error() {
+        let mut runtime = Runtime::new(Box::new(FakeHost::default()));
+        assert!(runtime.load("(defun partial () 1) (missing)").is_err());
+        let value = runtime.load("(try-eval (partial))").expect("try-eval partial");
+        assert!(is_tag(&value, "err"));
+    }
+
+    #[test]
+    fn try_load_is_atomic() {
+        let mut runtime = Runtime::new(Box::new(FakeHost::default()));
+        let value = runtime
+            .load("(try-load \"(defun partial-two () 2) (missing)\")")
+            .expect("try-load");
+        assert!(is_tag(&value, "err"));
+        let value = runtime.load("(try-eval (partial-two))").expect("try-eval partial-two");
+        assert!(is_tag(&value, "err"));
+    }
 }
 
 #[cfg(test)]
