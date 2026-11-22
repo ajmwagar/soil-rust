@@ -87,6 +87,10 @@ impl Host for WasmHost {
                 | ("wasi:io/streams", "output-stream.blocking-flush")
                 | ("wasi:filesystem", "read")
                 | ("wasi:filesystem", "write")
+                | ("wasi:clocks/monotonic-clock", "now")
+                | ("wasi:clocks/monotonic-clock", "resolution")
+                | ("wasi:clocks/wall-clock", "now")
+                | ("wasi:clocks/wall-clock", "resolution")
         )
     }
 
@@ -135,6 +139,38 @@ impl Host for WasmHost {
                     Ok(()) => ok(Value::Bool(true)),
                     Err(error) => stream_error(error),
                 })
+            }
+            ("wasi:clocks/monotonic-clock", "now") => {
+                Ok(Value::Int(wasip2::clocks::monotonic_clock::now() as i64))
+            }
+            ("wasi:clocks/monotonic-clock", "resolution") => Ok(Value::Int(
+                wasip2::clocks::monotonic_clock::resolution() as i64,
+            )),
+            ("wasi:clocks/wall-clock", "now") => {
+                let clock = wasip2::clocks::wall_clock::now();
+                Ok(Value::List(vec![
+                    Value::List(vec![
+                        Value::Keyword("seconds".into()),
+                        Value::Int(clock.seconds as i64),
+                    ]),
+                    Value::List(vec![
+                        Value::Keyword("nanoseconds".into()),
+                        Value::Int(i64::from(clock.nanoseconds)),
+                    ]),
+                ]))
+            }
+            ("wasi:clocks/wall-clock", "resolution") => {
+                let clock = wasip2::clocks::wall_clock::resolution();
+                Ok(Value::List(vec![
+                    Value::List(vec![
+                        Value::Keyword("seconds".into()),
+                        Value::Int(clock.seconds as i64),
+                    ]),
+                    Value::List(vec![
+                        Value::Keyword("nanoseconds".into()),
+                        Value::Int(i64::from(clock.nanoseconds)),
+                    ]),
+                ]))
             }
             ("wasi:filesystem", "read") => {
                 let path = args.first().and_then(Value::as_str).unwrap_or_default();
