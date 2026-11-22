@@ -903,6 +903,13 @@ impl Runtime {
                         let form = self.eval(require(items, 1, "eval")?, env)?;
                         self.eval(&form, env)
                     }
+                    "load" => {
+                        let source = self.eval(require(items, 1, "load")?, env)?;
+                        let source = source
+                            .as_str()
+                            .ok_or_else(|| anyhow!("load expects a string"))?;
+                        self.load_source(source, None)
+                    }
                     "host-call" => self.eval_host_call(items, env),
                     "keyword" => {
                         let value = self.eval(require(items, 1, "keyword")?, env)?;
