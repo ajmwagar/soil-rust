@@ -85,6 +85,8 @@ impl Host for WasmHost {
                 | ("wasi:io/streams", "input-stream.blocking-read")
                 | ("wasi:io/streams", "output-stream.blocking-write-and-flush")
                 | ("wasi:io/streams", "output-stream.blocking-flush")
+                | ("wasi:filesystem", "read")
+                | ("wasi:filesystem", "write")
         )
     }
 
@@ -132,6 +134,24 @@ impl Host for WasmHost {
                 Ok(match result {
                     Ok(()) => ok(Value::Bool(true)),
                     Err(error) => stream_error(error),
+                })
+            }
+            ("wasi:filesystem", "read") => {
+                let path = args.first().and_then(Value::as_str).unwrap_or_default();
+                Ok(match std::fs::read(path) {
+                    Ok(data) => ok(Value::String(String::from_utf8_lossy(&data).into_owned())),
+                    Err(error) => err(format!("read {path}: {error}")),
+                })
+            }
+            ("wasi:filesystem", "write") => {
+                let path = args.first().and_then(Value::as_str).unwrap_or_default();
+                let Some(contents) = args.get(1) else {
+                    return Ok(err("write needs bytes"));
+                };
+                let data = bytes(contents)?;
+                Ok(match std::fs::write(path, data) {
+                    Ok(()) => ok(Value::Bool(true)),
+                    Err(error) => err(format!("write {path}: {error}")),
                 })
             }
             ("wasi:io/streams", "output-stream.blocking-flush") => {
