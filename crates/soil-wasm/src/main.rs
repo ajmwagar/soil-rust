@@ -200,7 +200,10 @@ fn main() -> Result<()> {
         runtime.load_file(file)?;
     }
     if let Some(name) = call {
-        println!("{}", runtime.call(&name, &[])?);
+        let value = runtime.call(&name, &[])?;
+        if !matches!(value, Value::Nil) {
+            println!("{value}");
+        }
     }
     Ok(())
 }
