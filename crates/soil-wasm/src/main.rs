@@ -91,6 +91,7 @@ impl Host for WasmHost {
                 | ("wasi:filesystem", "read")
                 | ("wasi:filesystem", "write")
                 | ("wasi:filesystem", "list")
+                | ("wasi:filesystem", "mkdir")
                 | ("wasi:clocks/monotonic-clock", "now")
                 | ("wasi:clocks/monotonic-clock", "resolution")
                 | ("wasi:clocks/wall-clock", "now")
@@ -230,6 +231,16 @@ impl Host for WasmHost {
                     ]));
                 }
                 Ok(ok(Value::List(values)))
+            }
+            ("wasi:filesystem", "mkdir") => {
+                let path = args.first().and_then(Value::as_str).unwrap_or_default();
+                Ok(match std::fs::create_dir(path) {
+                    Ok(()) => ok(Value::Bool(true)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        ok(Value::Bool(false))
+                    }
+                    Err(error) => err(format!("mkdir {path}: {error}")),
+                })
             }
             ("wasi:filesystem", "read") => {
                 let path = args.first().and_then(Value::as_str).unwrap_or_default();
